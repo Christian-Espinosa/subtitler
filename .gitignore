@@ -1,0 +1,21 @@
+# Local / install clutter
+*.log
+.install.lock
+.wheels/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Ad-hoc test outputs (never commit)
+_test*/
+*_test/
+
+# Third-party WhisperX clone (has its own .git). Runtime is `pip install whisperx`.
+whisperX/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

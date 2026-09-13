@@ -1,95 +1,149 @@
 # Subtitler — manual
 
-Herramienta **local** (en tu PC, con GPU) para generar subtítulos **SRT** listos para YouTube / Bilibili.
+Local tool (your PC, GPU) that writes **SRT** subtitles ready for YouTube / Bilibili.
 
-Sirve sobre todo para vídeos donde se habla **español, inglés y/o chino mezclados**. El resultado por defecto es:
+It is aimed at videos that mix **Spanish, English and/or Chinese**. Default output:
 
-- un maestro en **inglés** (`subs.en.srt`)
-- una pista en **castellano** (`subs.es.srt`)
+- an **English** master (`subs.en.srt`)
+- a **Spanish** track (`subs.es.srt`)
 
-No sube nada a internet para transcribir: los modelos se descargan una vez y luego se usan desde caché.
-
----
-
-## 1. Glosario (términos que verás en logs y código)
-
-| Término | Qué es, en este proyecto |
-|---------|--------------------------|
-| **SRT** | Formato de subtítulos: número, reloj de inicio/fin, texto. Es el único formato que genera este repo. |
-| **Cue** | Un bloque del SRT: “desde 00:00:03 hasta 00:00:08, este texto”. |
-| **ASR** | *Automatic Speech Recognition*: pasar audio a texto. Aquí lo hace **Whisper** vía **WhisperX**. |
-| **Whisper / WhisperX** | Modelo de OpenAI (Whisper) + wrapper WhisperX (alineado de tiempos, VAD, CLI). El runtime instalado es `python -m whisperx`, no hace falta usar la carpeta `whisperX/` del repo. |
-| **`--task transcribe`** | Escribe en el **idioma del habla** (o el que fuerces con `--language`). |
-| **`--task translate`** | Whisper **solo traduce a inglés**. Aunque el audio sea español o chino, el SRT sale en inglés. Es intencional: las 3 pasadas se comparan en el mismo idioma. |
-| **`--language es\|en\|zh`** | **Asume** que todo el audio es ese idioma. Whisper no cambia de idioma a mitad de vídeo. Por eso hacemos 3 pasadas. |
-| **Pasada / pass** | Una ejecución de WhisperX con un idioma forzado. Archivos intermedios: `[nombre]._pass_en_from_es.srt` (etc.). |
-| **Hipótesis** | Cada pasada propone un texto inglés distinto para el mismo tramo. El árbitro elige una. |
-| **Árbitro** | Script `arbitrate_en_srt.py`: compara las 3 hipótesis y se queda con la más “inglés natural”. |
-| **Perplejidad (PPL)** | Número: “qué tan sorprendido está un modelo de lenguaje inglés” ante un texto. **Más bajo = más fluido**. No mide si el contenido es fiel al audio. |
-| **`distilgpt2`** | Mini GPT-2 usado solo para calcular esa perplejidad. No genera subtítulos. |
-| **Ventana / probe** | Trozo de tiempo (por defecto 3 s) donde el árbitro mira si hay un cue cuyo **centro (midpoint)** cae ahí. |
-| **Midpoint** | Mitad temporal de un cue. Evita re-puntuar el mismo párrafo largo en cada ventana de 3 s. |
-| **Resegment** | Partir cues densos (p. ej. 20 s de texto) en cues cortos que se puedan leer en pantalla. |
-| **CPS** | *Characters per second*: velocidad de lectura. ~18 es un tope típico de YouTube. |
-| **NLLB** | *No Language Left Behind* (Meta): traductor EN → ES o ZH. **No** escucha el audio; traduce el SRT inglés. |
-| **Hugging Face (HF)** | Sitio de modelos. Caché típica: `%USERPROFILE%\.cache\huggingface\hub\`. |
-| **`HF_ENDPOINT`** | URL alternativa del hub. En China / bloqueos: `https://hf-mirror.com`. |
-| **CUDA / `float16`** | Cálculo en GPU NVIDIA. `float16` ahorra VRAM (RTX 3060 Ti). |
-| **`batch_size`** | Cuántos trozos de audio procesa Whisper a la vez. Bájalo (p. ej. 4) si te quedas sin VRAM. |
-| **VAD** | *Voice Activity Detection*: detectar dónde hay voz. WhisperX usa Pyannote. |
-| **FFmpeg / ffprobe** | Extraen audio del vídeo y duraciones. Deben estar en el PATH de Windows. |
-| **torchcodec / triton** | Avisos frecuentes en Windows. **No paran** el pipeline si el SRT se genera. |
-| **Diarización** | Separar hablantes. **No** está activada (hace falta token HF). |
+Transcription never leaves the machine: models download once, then run from cache.
 
 ---
 
-## 2. Cómo ejecutar
+## Why this repo for subtitles
 
-### Pipeline alineado (recomendado desde 2026-09)
+Plenty of apps do “Whisper → SRT → translate” (for example [WhisperSubTranslate](https://github.com/Blue-B/WhisperSubTranslate): whisper.cpp plus Hy-MT2 / Gemini / DeepL). This repo ships the same product — SRT for YouTube / Bilibili — but the file is **better timed and more readable**, which is what you see after you publish.
 
-Doble clic en `subtitular_alineado.bat` (pide la ruta) o:
+### What those apps usually do
+
+1. Transcribe with **whisper.cpp** (or plain Whisper). Each cue is an audio *segment*, not a phrase measured word by word.
+2. Translate the text (sometimes with an LLM that sounds more natural than NLLB).
+3. Write the SRT using those segment clocks.
+
+That looks fine on a short, single-language clip. On a long video, fast speech, or mixed languages, the clock drifts: text appears over silence, runs ahead inside a paragraph, then snaps back at the next one. WhisperSubTranslate added “Sync” models because of that drift. Here the same failure was measured and the pipeline was changed ([§3-bis](#3-bis-why-the-aligned-pipeline-measured)).
+
+### What this repo does differently
+
+Timing and cue cuts are fixed **before** translation, and translation **does not touch the clocks**.
+
+```text
+video → ffmpeg
+      → WhisperX  --task transcribe  + word-level alignment
+      → build_subs.py   cuts on real word boundaries
+      → translate_srt.py  (NLLB)  same clocks, text only
+```
+
+| Piece | Why it shows up on screen |
+|-------|---------------------------|
+| **WhisperX, not whisper.cpp** | WhisperX pins every word to the audio. whisper.cpp gives one start/end per segment; everything inside is a guess. |
+| **`--task transcribe`, not `translate`** | `--task translate` in WhisperX **turns alignment off**. This repo’s old pipeline did that; cues came out ~24 s long and resegment guessed the inner cuts by character count. That is why they ran ahead. |
+| **`build_subs.py`** | Closes cues on sentence ends, commas, or the longest **measured** silence. YouTube-ish limits: ~42 characters, 2 lines, 1–6 s. |
+| **Translate last** | NLLB (or whatever translator you swap in) gets an already-cut SRT and copies the timestamps. Output language does not move the clock. |
+| **Measure, don’t guess** | `analyze_srt.py` and `measure_drift.py` report cues that start in silence, long lines, and CPS spikes. |
+
+Measured 2026-09-04 on a 23 min Spanish video, same machine, aligned pipeline vs the old “translate inside Whisper” flow:
+
+| | 3-pass + arbiter | This repo (aligned) |
+|---|---|---|
+| Cues that start **in silence** | 26.5% | **0%** |
+| Longest cue | 10.75 s | **5.98 s** (cap 6 s) |
+| Lines > 42 characters | 9.3% | **0.6%** |
+| Subtitles on screen vs real speech | 17.6 min / 14.9 min of speech | 15.1 min / 14.9 min |
+| Runtime | ~25 min | **~1 min** |
+
+The 26.5% silence figure is the one you notice while watching: text on screen when nobody is talking. Segment + Sync apps try to patch that. Here the cue **starts when the word starts**.
+
+### Where this repo does not win
+
+- **No GUI.** You launch a `.bat`. If you do not want paths or flags, an Electron app is easier.
+- **NLLB is more literal** than Gemini or DeepL (“Muy buenas gente” → “Very good people”). In return the text never goes to an API and the clocks do not move. For LLM style, change `translate_srt.py`; you do not need to change the ASR.
+- **One language per video** on the aligned flow. WhisperX aligns with one language model. Truly mixed cuts (es/en/zh in the same take) are still a gap (§7).
+- **No dubbing.** SRT only. Spoken translation is a different program.
+
+For **getting subtitles** — the SRT you upload to YouTube — this repo beats a generic Whisper + translator because the clock comes from the audio, not from an estimate, and translation cannot break it. The rest of this manual is how to run it and how to measure it.
+
+---
+
+## 1. Glossary (terms you will see in logs and code)
+
+| Term | What it means here |
+|------|--------------------|
+| **SRT** | Subtitle format: index, start/end clock, text. The only format this repo writes. |
+| **Cue** | One SRT block: “from 00:00:03 to 00:00:08, this text”. |
+| **ASR** | *Automatic Speech Recognition*: audio to text. Done by **Whisper** via **WhisperX**. |
+| **Whisper / WhisperX** | OpenAI’s Whisper plus the WhisperX wrapper (time alignment, VAD, CLI). The runtime is `python -m whisperx`; you do not need the `whisperX/` folder. |
+| **`--task transcribe`** | Writes in the **spoken language** (or whatever you force with `--language`). |
+| **`--task translate`** | Whisper **only translates to English**. Spanish or Chinese audio still yields an English SRT. Intentional: the 3 passes are compared in one language. |
+| **`--language es\|en\|zh`** | **Assumes** the whole file is that language. Whisper does not switch mid-video. That is why the old flow ran 3 passes. |
+| **Pass** | One WhisperX run with a forced language. Intermediates: `[name]._pass_en_from_es.srt` (etc.). |
+| **Hypothesis** | Each pass proposes a different English text for the same span. The arbiter picks one. |
+| **Arbiter** | `arbitrate_en_srt.py`: compares the 3 hypotheses and keeps the most “natural English”. |
+| **Perplexity (PPL)** | “How surprised is an English language model” by a text. **Lower = more fluent**. It does not measure fidelity to the audio. |
+| **`distilgpt2`** | Tiny GPT-2 used only to compute that perplexity. It does not write subtitles. |
+| **Window / probe** | Time slice (default 3 s) where the arbiter looks for a cue whose **midpoint** falls inside. |
+| **Midpoint** | Temporal middle of a cue. Avoids re-scoring the same long paragraph in every 3 s window. |
+| **Resegment** | Split dense cues (e.g. 20 s of text) into short on-screen cues. |
+| **CPS** | *Characters per second*: reading speed. ~18 is a typical YouTube cap. |
+| **NLLB** | Meta’s *No Language Left Behind*: EN → ES or ZH. **Does not** listen to audio; it translates the English SRT. |
+| **Hugging Face (HF)** | Model host. Typical cache: `%USERPROFILE%\.cache\huggingface\hub\`. |
+| **`HF_ENDPOINT`** | Alternate hub URL. In China / blocks: `https://hf-mirror.com`. |
+| **CUDA / `float16`** | NVIDIA GPU math. `float16` saves VRAM (RTX 3060 Ti). |
+| **`batch_size`** | How many audio chunks Whisper processes at once. Drop it (e.g. 4) if you OOM. |
+| **VAD** | *Voice Activity Detection*: where speech is. WhisperX uses Pyannote. |
+| **FFmpeg / ffprobe** | Extract audio and durations. Must be on the Windows PATH. |
+| **torchcodec / triton** | Common Windows warnings. **They do not stop** the pipeline if an SRT is written. |
+| **Diarization** | Speaker split. **Off** (needs an HF token). |
+
+---
+
+## 2. How to run
+
+### Aligned pipeline (recommended since 2026-09)
+
+Double-click `subtitular_alineado.bat` (it asks for a path) or:
 
 ```bat
 subtitular_alineado.bat "D:\Videos\mi_video.mp4"
 subtitular_alineado.bat "video.mp4" --language es --langs es,en
 ```
 
-Transcribe en el idioma hablado, **alinea palabra por palabra** y traduce después. Es el que arregla los subtítulos que se adelantaban y los bloques con demasiado texto: ver [§3-bis](#3-bis-por-qué-el-pipeline-alineado-medido). Tarda **~1 minuto por cada 20 de vídeo**, frente a los ~25 del pipeline de 3 pasadas.
+Transcribes in the spoken language, **aligns word by word**, then translates. This is the one that fixes early-running cues and oversized blocks: see [§3-bis](#3-bis-why-the-aligned-pipeline-measured). Takes **~1 minute per 20 of video**, versus ~25 for the 3-pass pipeline.
 
-**Salida:** `[nombre] subs.es.srt` (idioma hablado) y `[nombre] subs.en.srt` (traducción).
+**Output:** `[name] subs.es.srt` (spoken language) and `[name] subs.en.srt` (translation).
 
-### Pipeline de 3 pasadas + árbitro (heredado)
+### 3-pass + arbiter pipeline (legacy)
 
-Sigue disponible, pero **no se recomienda**: mide peor en todo (§3-bis).
+Still there, **not recommended**: it measures worse on everything (§3-bis).
 
 ```bat
 subtitular_en_master.bat "D:\Videos\mi_video.mp4"
 ```
 
-Las comillas se quitan solas si pegas la ruta desde el Explorador.
+Quotes are stripped if you paste a path from Explorer.
 
-**Salida, misma carpeta que el vídeo:**
+**Output, same folder as the video:**
 
-| Archivo | Qué es |
-|---------|--------|
-| `[nombre] subs.en.srt` | Maestro inglés, ya resegmentado para pantalla |
-| `[nombre] subs.es.srt` | Castellano (traducción NLLB del inglés) |
-| `[nombre]._arbiter.json` | Depuración: qué pasada ganó cada cue |
+| File | What it is |
+|------|------------|
+| `[name] subs.en.srt` | English master, already resegmented for the screen |
+| `[name] subs.es.srt` | Spanish (NLLB translation of the English) |
+| `[name]._arbiter.json` | Debug: which pass won each cue |
 
-Los pases `._pass_en_from_*.srt` se **borran** al terminar. Para conservarlos: `--keep-passes`.
+`._pass_en_from_*.srt` files are **deleted** at the end. Keep them with `--keep-passes`.
 
-### Modo simple (1 sola pasada Whisper)
+### Simple mode (one Whisper pass)
 
-Si el vídeo es **casi todo un idioma** y no hace falta árbitro:
+If the video is **almost all one language** and you do not need the arbiter:
 
 ```bat
 subtitular.bat "D:\Videos\mi_video.mp4"
 subtitular.bat "video.mp4" --language es
 ```
 
-Salida: `[nombre] subs.srt`.
+Output: `[name] subs.srt`.
 
-### Flags del pipeline (se pasan al `.bat`)
+### Pipeline flags (passed through to the `.bat`)
 
 ```bat
 subtitular_en_master.bat "video.mp4" --langs en,es,zh
@@ -100,66 +154,66 @@ subtitular_en_master.bat "video.mp4" --window 3
 subtitular_en_master.bat "video.mp4" --skip-whisperx
 ```
 
-`--skip-whisperx` reutiliza los `._pass_*.srt` que ya existan (hace falta `--keep-passes` en una corrida anterior).
+`--skip-whisperx` reuses existing `._pass_*.srt` files (you need `--keep-passes` on a previous run).
 
 ---
 
-## 3. Flujo del pipeline (paso a paso)
+## 3. Pipeline flow (step by step)
 
-El orquestador es `pipeline_en_master.py`. Lo lanza `subtitular_en_master.bat`.
+The orchestrator is `pipeline_en_master.py`. `subtitular_en_master.bat` launches it.
 
 ```text
-vídeo / audio
+video / audio
         │
         ▼
  ┌─────────────────────────────────────────────────────────┐
- │ PASOS 1–3  WhisperX × 3                                 │
- │   cada uno: --task translate --language es | en | zh    │
- │   los 3 SRT están en INGLÉS                             │
- │   archivos: [stem]._pass_en_from_es.srt  (etc.)         │
+ │ STEPS 1–3  WhisperX × 3                                 │
+ │   each: --task translate --language es | en | zh        │
+ │   all 3 SRTs are ENGLISH                                │
+ │   files: [stem]._pass_en_from_es.srt  (etc.)            │
  └─────────────────────────────────────────────────────────┘
         │
         ▼
  ┌─────────────────────────────────────────────────────────┐
- │ PASO 4  Árbitro (distilgpt2)                            │
- │   elige 1 hipótesis por cue (menor PPL)                 │
- │   escribe [stem] subs.en.srt  (cues aún largos)         │
- │   escribe [stem]._arbiter.json                          │
- │   borra los _pass_*  (salvo --keep-passes)              │
+ │ STEP 4  Arbiter (distilgpt2)                            │
+ │   picks 1 hypothesis per cue (lowest PPL)               │
+ │   writes [stem] subs.en.srt  (cues still long)          │
+ │   writes [stem]._arbiter.json                           │
+ │   deletes _pass_*  (unless --keep-passes)               │
  └─────────────────────────────────────────────────────────┘
         │
         ▼
  ┌─────────────────────────────────────────────────────────┐
- │ PASO 5  Resegment                                       │
- │   parte frases, 2 líneas, ~42 chars, ~18 CPS, 1–6 s     │
- │   reescribe el mismo subs.en.srt                        │
+ │ STEP 5  Resegment                                       │
+ │   splits sentences, 2 lines, ~42 chars, ~18 CPS, 1–6 s  │
+ │   overwrites the same subs.en.srt                       │
  └─────────────────────────────────────────────────────────┘
         │
         ▼
  ┌─────────────────────────────────────────────────────────┐
- │ PASO 6  NLLB                                            │
- │   traduce cada cue EN → ES (mismos tiempos)             │
- │   escribe [stem] subs.es.srt                            │
+ │ STEP 6  NLLB                                            │
+ │   translates each cue EN → ES (same clocks)             │
+ │   writes [stem] subs.es.srt                             │
  └─────────────────────────────────────────────────────────┘
 ```
 
-**Por qué 3 pasadas.** Whisper **fija un idioma para todo el archivo**. Si fuerzas `es` y de pronto hablas chino, esa pasada suele salir mal. La pasada cuyo idioma coincide con lo hablado produce inglés coherente; las otras, basura o calcos. El árbitro elige tramo a tramo.
+**Why 3 passes.** Whisper **locks one language for the whole file**. If you force `es` and then speak Chinese, that pass usually fails. The pass whose language matches the speech produces coherent English; the others produce junk or calques. The arbiter picks span by span.
 
-> Esta idea tiene un fallo que solo se ve midiendo: el árbitro premia el inglés más *fluido*, no el más *fiel*, y una alucinación siempre suena fluida. Ver §3-bis.
+> This idea has a bug you only see by measuring: the arbiter rewards the most *fluent* English, not the most *faithful*, and a hallucination always sounds fluent. See §3-bis.
 
-**Qué no hace el pipeline.** No corrige errores de ASR (“breakfast” vs “ayuno”). El árbitro solo elige entre tres textos. NLLB solo traduce el inglés ya elegido.
+**What the pipeline does not do.** It does not fix ASR errors (“breakfast” vs “ayuno”). The arbiter only chooses among three texts. NLLB only translates the English already chosen.
 
-En consola verás `PASO x/y`, tiempo transcurrido y un **ETA** aproximado (no es exacto; la primera vez con descarga es más lenta).
+The console prints `PASO x/y`, elapsed time, and a rough **ETA** (not exact; first run with downloads is slower).
 
 ---
 
-## 3-bis. Por qué el pipeline alineado (medido)
+## 3-bis. Why the aligned pipeline (measured)
 
-Diagnóstico hecho el 2026-09-04 sobre `Microfono 1.0.mp4` (23 min, español), comparando la salida real del pipeline de 3 pasadas contra la del alineado.
+Diagnosis on 2026-09-04 on `Microfono 1.0.mp4` (23 min, Spanish), comparing the real 3-pass output to the aligned one.
 
-### La causa de casi todo: `--task translate` desactiva la alineación
+### The root cause: `--task translate` disables alignment
 
-En `whisperX/whisperx/transcribe.py`:
+In `whisperX/whisperx/transcribe.py`:
 
 ```python
 if task == "translate":
@@ -167,17 +221,17 @@ if task == "translate":
     no_align = True
 ```
 
-El pipeline de 3 pasadas usa `--task translate` en las tres. Es decir, **desactiva el alineado forzado**, que es justamente lo que WhisperX añade sobre Whisper. Consecuencias en cadena:
+The 3-pass pipeline uses `--task translate` on all three. That **turns off forced alignment**, which is the whole point of WhisperX over Whisper. Knock-on effects:
 
-1. Sin alineado, WhisperX emite **un cue por cada bloque VAD de 30 s** (`chunk_size=30` en `asr.py`). Medido: los cues que el árbitro eligió tenían una **mediana de 23,6 s**.
-2. El árbitro compara párrafos enteros de 24 s con perplejidad, y al ganar uno salta las ventanas siguientes (`covered_until`). En este vídeo eso **saltó 15,4 minutos** de decisiones.
-3. `resegment_srt.py` recibe bloques de 24 s con solo un inicio y un final, así que **estima** dónde va cada frase contando caracteres. De los 309 cues finales, solo unos 50 tenían límites tomados del audio: el resto eran cuentas.
+1. Without alignment, WhisperX emits **one cue per 30 s VAD chunk** (`chunk_size=30` in `asr.py`). Measured: cues the arbiter picked had a **median of 23.6 s**.
+2. The arbiter compares whole 24 s paragraphs by perplexity, and after a win it skips later windows (`covered_until`). On this video that **skipped 15.4 minutes** of decisions.
+3. `resegment_srt.py` gets 24 s blocks with only a start and an end, so it **guesses** each sentence boundary by counting characters. Of 309 final cues, only about 50 had boundaries taken from the audio; the rest were counts.
 
-Por eso los subtítulos se adelantaban dentro de un párrafo y volvían a cuadrar en el siguiente.
+That is why subtitles ran ahead inside a paragraph and snapped back at the next one.
 
-### El árbitro premia fluidez, no fidelidad
+### The arbiter rewards fluency, not fidelity
 
-En un vídeo **100% en español**, la pasada que más ganó fue la del **chino: 64%** (32 de 50 decisiones), frente al 18% de la española. Y el caso extremo:
+On a video that is **100% Spanish**, the winning pass was **Chinese: 64%** (32 of 50 decisions), versus 18% for Spanish. Extreme case:
 
 ```text
 269
@@ -185,126 +239,126 @@ En un vídeo **100% en español**, la pasada que más ganó fue la del **chino: 
 Leading Starring Qin Liying,
 ```
 
-Créditos de televisión china inventados sobre un tramo **sin voz**, que se quedaron en pantalla mientras nadie hablaba. Whisper alucina cuando se le fuerza un idioma que no oye, y `distilgpt2` puntúa esa alucinación como buen inglés, porque lo es.
+Invented Chinese TV credits over a stretch **with no voice**, left on screen while nobody spoke. Whisper hallucinates when you force a language it does not hear, and `distilgpt2` scores that hallucination as good English, because it is.
 
-### Números, antes y después
+### Numbers, before and after
 
-Pista inglesa, mismo vídeo:
+English track, same video:
 
-| Métrica | 3 pasadas + árbitro | Alineado | |
+| Metric | 3-pass + arbiter | Aligned | |
 |---|---|---|---|
-| Cue más largo | 10,75 s | **5,98 s** | el límite era 6 s |
-| Cues > 6 s | 7,1% (15% del tiempo) | **0%** | |
-| Líneas > 42 caracteres | 9,3% | **0,6%** | |
-| Cues que empiezan **en silencio** | 26,5% | **0%** | |
-| Subtítulos en pantalla | 17,6 min | **15,1 min** | hay 14,9 min de voz |
-| Tiempo de proceso | ~25 min | **1 min 10 s** | |
+| Longest cue | 10.75 s | **5.98 s** | cap was 6 s |
+| Cues > 6 s | 7.1% (15% of time) | **0%** | |
+| Lines > 42 characters | 9.3% | **0.6%** | |
+| Cues that start **in silence** | 26.5% | **0%** | |
+| Subtitles on screen | 17.6 min | **15.1 min** | there are 14.9 min of speech |
+| Runtime | ~25 min | **1 min 10 s** | |
 
-Dos avisos honestos:
+Two honest caveats:
 
-- Los **0%** del alineado son coherencia interna: los cues se construyen desde la misma alineación con la que se mide. Lo que sí es independiente es el 26,5% del antiguo, y que sacaba 17,6 min de subtítulos para 14,9 min de voz.
-- El alineado tiene **más cues densos** (13% por encima de 18 CPS, frente al 2%). No es un empeoramiento real: el antiguo bajaba el CPS dejando el texto en pantalla durante los silencios. Aquí el cue dura lo que dura la frase más 0,6 s de cortesía.
+- The aligned **0%** figures are internally consistent: cues are built from the same alignment they are scored against. What is independent is the old 26.5%, and that it put 17.6 min of subtitles on 14.9 min of speech.
+- The aligned flow has **more dense cues** (13% over 18 CPS, versus 2%). That is not a real regression: the old flow lowered CPS by leaving text on screen through silences. Here the cue lasts as long as the phrase plus 0.6 s of courtesy.
 
-### Flujo nuevo
+### New flow
 
 ```text
-vídeo → ffmpeg (16 kHz mono)
-      → WhisperX  --task transcribe  (alineación ON)  → JSON con tiempos por palabra
-      → build_subs.py    corta en fronteras reales de palabra
-      → translate_srt.py NLLB, traduce el texto y NO toca los tiempos
+video → ffmpeg (16 kHz mono)
+      → WhisperX  --task transcribe  (alignment ON)  → JSON with per-word times
+      → build_subs.py    cuts on real word boundaries
+      → translate_srt.py NLLB, translates text and does NOT touch clocks
 ```
 
-La traducción va al final a propósito: así el idioma de salida no condiciona la sincronía. Lo que sí cambia es el **estilo**: Whisper traduciendo escribe un inglés más natural que NLLB, que es más literal ("Muy buenas gente" → "Very good people"). A cambio, lo que dice es lo que se dijo: donde el antiguo puso *"Go."*, el audio decía *"¡Fuego!"*.
+Translation is last on purpose: output language never conditions sync. Style does change: Whisper-translating writes more natural English than NLLB, which is more literal (“Muy buenas gente” → “Very good people”). In return it says what was said: where the old flow wrote *"Go."*, the audio was *"¡Fuego!"*.
 
 ---
 
-## 4. Qué hace cada archivo
+## 4. What each file does
 
 ### `subtitular_en_master.bat`
 
-Punto de entrada. Comprueba Python 3.12, pide o recibe la ruta, quita comillas, llama a `pipeline_en_master.py`.
+Entry point. Checks Python 3.12, asks for or takes a path, strips quotes, calls `pipeline_en_master.py`.
 
-| Variable | Default | Para qué |
+| Variable | Default | What for |
 |----------|---------|----------|
-| `PY312` | ruta a `python.exe` 3.12 | Si cambias de instalación de Python |
-| `PIPE` | `pipeline_en_master.py` junto al `.bat` | No hace falta tocarla |
-| `EXTRA_ARGS` | vacío | Flags **siempre** añadidos (ej. `--langs en,es,zh`) |
-| `HF_ENDPOINT` | `https://hf-mirror.com` | Espejo HF; vacío = hub oficial |
+| `PY312` | path to `python.exe` 3.12 | If you change Python install |
+| `PIPE` | `pipeline_en_master.py` next to the `.bat` | Leave it |
+| `EXTRA_ARGS` | empty | Flags **always** appended (e.g. `--langs en,es,zh`) |
+| `HF_ENDPOINT` | `https://hf-mirror.com` | HF mirror; empty = official hub |
 
 ### `subtitular.bat`
 
-Una sola llamada a WhisperX (`transcribe` implícito, no translate). Renombra `[stem].srt` → `[stem] subs.srt`.
+One WhisperX call (`transcribe` implicit, not translate). Renames `[stem].srt` → `[stem] subs.srt`.
 
-| Variable | Default | Para qué |
+| Variable | Default | What for |
 |----------|---------|----------|
-| `PY312` | Python 3.12 | Igual que arriba |
-| `WHISPER_MODEL` | `large-v2` | Modelo ASR |
-| `BATCH_SIZE` | `8` | VRAM; bajar si OOM |
-| `COMPUTE_TYPE` | `float16` | Precisión GPU |
-| `DEFAULT_LANGUAGE` | vacío | Auto-detect; o `es` / `en` / `zh` |
-| `HF_ENDPOINT` | espejo | Igual que arriba |
+| `PY312` | Python 3.12 | Same as above |
+| `WHISPER_MODEL` | `large-v2` | ASR model |
+| `BATCH_SIZE` | `8` | VRAM; lower if OOM |
+| `COMPUTE_TYPE` | `float16` | GPU precision |
+| `DEFAULT_LANGUAGE` | empty | Auto-detect; or `es` / `en` / `zh` |
+| `HF_ENDPOINT` | mirror | Same as above |
 
 ### `pipeline_en_master.py`
 
-Orquesta los 4 programas. **Aquí está el CONFIG principal** si quieres cambiar el comportamiento por defecto.
+Orchestrates the 4 programs. **Main CONFIG** if you want to change defaults.
 
-| Variable | Default | Significado |
-|----------|---------|-------------|
-| `PYTHON` | Python 3.12 | Interprete para WhisperX y los scripts hijos |
-| `HF_ENDPOINT` | `https://hf-mirror.com` | Espejo Hugging Face |
-| `WHISPER_MODEL` | `large-v2` | Tamaño del ASR (`large-v3` es más pesado) |
-| `WHISPER_BATCH_SIZE` | `8` | Lotes en GPU |
-| `WHISPER_COMPUTE_TYPE` | `float16` | Tipo de cálculo |
-| `WHISPER_PASS_LANGS` | `es, en, zh` | Idiomas de audio forzados (3 hipótesis) |
-| `WHISPER_ETA_RTF` | `0.30` | Solo ETA: 0.30 = ~30 % de la duración del vídeo por pasada |
-| `ARBITER_WINDOW_SEC` | `3.0` | Tamaño del probe del árbitro (s) |
-| `FLUENCY_MODEL` | `distilgpt2` | LM de perplejidad |
-| `ARBITER_ETA_SEC_PER_MIN` | `8.0` | Solo ETA |
-| `OUTPUT_SUB_LANGS` | `en, es` | Pistas finales. Añade `"zh"` para chino |
-| `RESEGMENT` | `True` | Si `False`, no parte cues para pantalla |
-| `RESEGMENT_MAX_CHARS` | `42` | Máx. caracteres por línea |
-| `RESEGMENT_MAX_LINES` | `2` | Máx. líneas por cue |
-| `RESEGMENT_MAX_CPS` | `18.0` | Tope de lectura |
-| `RESEGMENT_MIN_SEC` | `1.0` | Duración mínima de un cue |
-| `RESEGMENT_MAX_SEC` | `6.0` | Duración máxima objetivo |
-| `NLLB_MODEL` | `facebook/nllb-200-distilled-600M` | Traductor |
-| `NLLB_ETA_SEC_PER_MIN` | `12.0` | Solo ETA |
-| `KEEP_PASSES` | `False` | Conservar `_pass_*.srt` |
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PYTHON` | Python 3.12 | Interpreter for WhisperX and child scripts |
+| `HF_ENDPOINT` | `https://hf-mirror.com` | Hugging Face mirror |
+| `WHISPER_MODEL` | `large-v2` | ASR size (`large-v3` is heavier) |
+| `WHISPER_BATCH_SIZE` | `8` | GPU batches |
+| `WHISPER_COMPUTE_TYPE` | `float16` | Compute type |
+| `WHISPER_PASS_LANGS` | `es, en, zh` | Forced audio languages (3 hypotheses) |
+| `WHISPER_ETA_RTF` | `0.30` | ETA only: 0.30 ≈ 30% of video duration per pass |
+| `ARBITER_WINDOW_SEC` | `3.0` | Arbiter probe size (s) |
+| `FLUENCY_MODEL` | `distilgpt2` | Perplexity LM |
+| `ARBITER_ETA_SEC_PER_MIN` | `8.0` | ETA only |
+| `OUTPUT_SUB_LANGS` | `en, es` | Final tracks. Add `"zh"` for Chinese |
+| `RESEGMENT` | `True` | If `False`, do not split cues for the screen |
+| `RESEGMENT_MAX_CHARS` | `42` | Max characters per line |
+| `RESEGMENT_MAX_LINES` | `2` | Max lines per cue |
+| `RESEGMENT_MAX_CPS` | `18.0` | Reading cap |
+| `RESEGMENT_MIN_SEC` | `1.0` | Minimum cue duration |
+| `RESEGMENT_MAX_SEC` | `6.0` | Target maximum duration |
+| `NLLB_MODEL` | `facebook/nllb-200-distilled-600M` | Translator |
+| `NLLB_ETA_SEC_PER_MIN` | `12.0` | ETA only |
+| `KEEP_PASSES` | `False` | Keep `_pass_*.srt` |
 
-Los flags CLI (`--langs`, `--window`, …) **pisan** estos defaults en esa ejecución.
+CLI flags (`--langs`, `--window`, …) **override** these defaults for that run.
 
 ### `pipeline_aligned.py` + `subtitular_alineado.bat`
 
-Orquestador del flujo recomendado. **Aquí está el CONFIG** del pipeline nuevo.
+Orchestrator of the recommended flow. **CONFIG** for the new pipeline.
 
-| Variable | Default | Significado |
-|----------|---------|-------------|
-| `PYTHON` | Python 3.12 | Intérprete |
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PYTHON` | Python 3.12 | Interpreter |
 | `WHISPER_MODEL` | `large-v2` | ASR |
-| `WHISPER_BATCH_SIZE` | `8` | Bajar a 4 si falta VRAM |
-| `SPOKEN_LANGUAGE` | vacío | Idioma hablado; vacío = detectar |
-| `OUTPUT_SUB_LANGS` | `es, en` | Pistas a escribir |
-| `MAX_CHARS_PER_LINE` / `MAX_LINES` | `42` / `2` | Límites de pantalla |
-| `MAX_CUE_SEC` / `MIN_CUE_SEC` | `6.0` / `1.0` | Duración de cue |
-| `KEEP_WORK` | `False` | Conservar `_work/` (audio + JSON alineado) |
+| `WHISPER_BATCH_SIZE` | `8` | Drop to 4 if VRAM is tight |
+| `SPOKEN_LANGUAGE` | empty | Spoken language; empty = detect |
+| `OUTPUT_SUB_LANGS` | `es, en` | Tracks to write |
+| `MAX_CHARS_PER_LINE` / `MAX_LINES` | `42` / `2` | Screen limits |
+| `MAX_CUE_SEC` / `MIN_CUE_SEC` | `6.0` / `1.0` | Cue duration |
+| `KEEP_WORK` | `False` | Keep `_work/` (audio + alignment JSON) |
 
-Flags útiles: `--language es`, `--langs es,en,zh`, `--skip-translate`, `--keep-work`, y `--skip-whisperx` para rehacer los subtítulos sin volver a transcribir (necesita `--keep-work` de una corrida anterior).
+Useful flags: `--language es`, `--langs es,en,zh`, `--skip-translate`, `--keep-work`, and `--skip-whisperx` to rebuild subtitles without transcribing again (needs `--keep-work` from a previous run).
 
 ### `build_subs.py`
 
-Convierte la alineación por palabra en cues legibles. Es el sustituto de `resegment_srt.py` en el flujo alineado, y la diferencia es de fondo: aquí cada palabra trae su timestamp, así que los cortes se **miden** en vez de estimarse.
+Turns word-level alignment into readable cues. Replaces `resegment_srt.py` on the aligned flow. The difference is fundamental: every word already has a timestamp, so cuts are **measured**, not estimated.
 
-Orden de preferencia para cerrar un cue: final de frase → coma o punto y coma → el silencio más largo dentro del cue → el límite de caracteres.
+Preference order for closing a cue: sentence end → comma or semicolon → longest silence inside the cue → character limit.
 
 ```bat
 python build_subs.py --align _work/video.json --out "video subs.es.srt"
 ```
 
-No lleva regla de CPS a propósito: partir un cue no cambia la velocidad a la que habla nadie. La densidad se compensa dejando el cue en pantalla 0,6 s tras la última palabra, si el silencio lo permite.
+No CPS rule on purpose: splitting a cue does not change how fast anyone talks. Density is handled by leaving the cue on screen 0.6 s after the last word, if silence allows.
 
 ### `analyze_srt.py`
 
-Mide un SRT: duraciones, líneas largas, CPS, solapes y, si le pasas el `_arbiter.json`, cómo repartió las victorias el árbitro.
+Measures an SRT: durations, long lines, CPS, overlaps, and, if you pass `_arbiter.json`, how the arbiter split the wins.
 
 ```bat
 python analyze_srt.py --in "video subs.en.srt" --compare "otro.srt"
@@ -313,7 +367,7 @@ python analyze_srt.py --in "video subs.en.srt" --arbiter "video._arbiter.json"
 
 ### `measure_drift.py`
 
-Comprueba si un SRT está sincronizado, usando la alineación por palabra como referencia. Dice cuántos cues aparecen **antes de que alguien hable** y lista los peores.
+Checks whether an SRT is in sync, using word-level alignment as the reference. Reports how many cues appear **before anyone speaks** and lists the worst.
 
 ```bat
 python measure_drift.py --srt "video subs.en.srt" --align _work/video.json
@@ -321,164 +375,164 @@ python measure_drift.py --srt "video subs.en.srt" --align _work/video.json
 
 ### `arbitrate_en_srt.py`
 
-Lee 3 SRT en inglés. Recorre el tiempo en ventanas. Si el **midpoint** de un cue cae en la ventana, puntúa las 3 hipótesis con `distilgpt2` y gana la de **menor PPL**. Escribe el SRT maestro con los **tiempos originales de Whisper** (cues largos). No vuelve a decidir hasta que ese cue termina.
+Reads 3 English SRTs. Walks time in windows. If a cue’s **midpoint** falls in the window, it scores the 3 hypotheses with `distilgpt2` and the **lowest PPL** wins. Writes the master SRT with **Whisper’s original clocks** (long cues). Does not decide again until that cue ends.
 
-Uso suelto:
+Standalone:
 
 ```bat
 python arbitrate_en_srt.py --es from_es.srt --en from_en.srt --zh from_zh.srt --out "video subs.en.srt" --json decisions.json
 ```
 
-| Variable | Default | Significado |
-|----------|---------|-------------|
+| Variable | Default | Meaning |
+|----------|---------|---------|
 | `DEFAULT_WINDOW_SEC` | `3.0` | Probe |
-| `DEFAULT_FLUENCY_MODEL` | `distilgpt2` | Prefiere snapshot local en caché HF |
+| `DEFAULT_FLUENCY_MODEL` | `distilgpt2` | Prefers a local snapshot in the HF cache |
 
-El JSON incluye `probe_start` / `probe_end` (ventana), `start` / `end` (cue ganador), `winner`, `scores`, `candidates`.
+The JSON includes `probe_start` / `probe_end` (window), `start` / `end` (winning cue), `winner`, `scores`, `candidates`.
 
 ### `resegment_srt.py`
 
-Parte el maestro inglés para que se pueda leer: frases, wrap a 2 líneas, huecos mínimos entre cues.
+Splits the English master so it can be read: sentences, wrap to 2 lines, minimum gaps between cues.
 
 ```bat
 python resegment_srt.py --in "video subs.en.srt"
 ```
 
-| Variable | Default | Significado |
-|----------|---------|-------------|
-| `MAX_CHARS_PER_LINE` | `42` | Ancho de línea |
-| `MAX_LINES` | `2` | Líneas por cue |
-| `MAX_CPS` | `18.0` | Velocidad de lectura |
-| `MIN_CUE_SEC` | `1.0` | No más cortos que esto (salvo necesidad) |
-| `MAX_CUE_SEC` | `6.0` | Intenta no pasar de esto |
-| `MIN_GAP_SEC` | `0.08` | Hueco entre cues adyacentes |
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MAX_CHARS_PER_LINE` | `42` | Line width |
+| `MAX_LINES` | `2` | Lines per cue |
+| `MAX_CPS` | `18.0` | Reading speed |
+| `MIN_CUE_SEC` | `1.0` | No shorter than this (unless forced) |
+| `MAX_CUE_SEC` | `6.0` | Try not to exceed this |
+| `MIN_GAP_SEC` | `0.08` | Gap between adjacent cues |
 
-**No** lo uses sobre el ES después de NLLB: partiría tiempos y desincronizaría EN/ES. El ES solo hace *wrap* de líneas (ver abajo).
+**Do not** run it on the ES file after NLLB: that would split clocks and desync EN/ES. ES only *wraps* lines (see below).
 
 ### `translate_srt.py`
 
-NLLB: cada cue inglés → español (y/o chino). **Mismos timestamps** que el EN. Luego envuelve líneas (`WRAP_*`) sin cambiar tiempos.
+NLLB: each English cue → Spanish (and/or Chinese). **Same timestamps** as EN. Then wraps lines (`WRAP_*`) without changing clocks.
 
 ```bat
 python translate_srt.py --in "video subs.en.srt" --langs es
 python translate_srt.py --in "video subs.en.srt" --langs es,zh
 ```
 
-Si corriges el EN a mano, vuelve a lanzar **solo** este script para regenerar ES.
+If you edit EN by hand, rerun **only** this script to regenerate ES.
 
-| Variable | Default | Significado |
-|----------|---------|-------------|
-| `NLLB_MODEL` | `nllb-200-distilled-600M` | Modelo de traducción |
-| `DEFAULT_TARGET_LANGS` | `es` | Si no pasas `--langs` |
-| `BATCH_SIZE` | `16` | Cues por lote GPU |
-| `MAX_LENGTH` | `256` | Tokens máximos generados |
-| `DEVICE` | auto CUDA | `cuda` o `cpu` |
-| `WRAP_MAX_CHARS` | `42` | Wrap visual ES/ZH |
-| `WRAP_MAX_LINES` | `2` | Líneas |
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `NLLB_MODEL` | `nllb-200-distilled-600M` | Translation model |
+| `DEFAULT_TARGET_LANGS` | `es` | If you omit `--langs` |
+| `BATCH_SIZE` | `16` | Cues per GPU batch |
+| `MAX_LENGTH` | `256` | Max generated tokens |
+| `DEVICE` | auto CUDA | `cuda` or `cpu` |
+| `WRAP_MAX_CHARS` | `42` | Visual wrap ES/ZH |
+| `WRAP_MAX_LINES` | `2` | Lines |
 
-Códigos NLLB internos: `en` → `eng_Latn`, `es` → `spa_Latn`, `zh` → `zho_Hans` (simplificado).
+Internal NLLB codes: `en` → `eng_Latn`, `es` → `spa_Latn`, `zh` → `zho_Hans` (simplified).
 
 ### `safe_downloader/`
 
-Plantilla para descargar modelos grandes con watchdog (red inestable / China). Ver [`safe_downloader/README.md`](safe_downloader/README.md).
+Template for large model downloads with a watchdog (flaky network / China). See [`safe_downloader/README.md`](safe_downloader/README.md).
 
-Scripts típicos: `install_distilgpt2.ps1`, `install_nllb.ps1`, `install_faster_whisper_large_v2.ps1`.
+Typical scripts: `install_distilgpt2.ps1`, `install_nllb.ps1`, `install_faster_whisper_large_v2.ps1`.
 
 ### `whisperX/`
 
-Clon de referencia del código de WhisperX. **El que se ejecuta** es el paquete `pip` (`python -m whisperx`). No hace falta tocar esta carpeta para subtitular.
+Reference clone of WhisperX. **What actually runs** is the `pip` package (`python -m whisperx`). You do not need this folder to subtitle.
 
 ---
 
-## 5. Requisitos
+## 5. Requirements
 
-| Pieza | Notas |
+| Piece | Notes |
 |-------|--------|
-| Python **3.12** | WhisperX no soporta 3.14 |
-| `whisperx` + PyTorch **CUDA** | En ese Python |
-| FFmpeg y ffprobe | En el PATH |
-| GPU | Probado en RTX 3060 Ti |
-| Modelos | ASR `large-v2`, `distilgpt2`, NLLB-600M (caché HF) |
+| Python **3.12** | WhisperX does not support 3.14 |
+| `whisperx` + PyTorch **CUDA** | In that Python |
+| FFmpeg and ffprobe | On PATH |
+| GPU | Tested on RTX 3060 Ti |
+| Models | ASR `large-v2`, `distilgpt2`, NLLB-600M (HF cache) |
 
-Si `huggingface.co` no conecta, deja `HF_ENDPOINT=https://hf-mirror.com` (ya está en los `.bat` y en el pipeline).
+If `huggingface.co` does not connect, leave `HF_ENDPOINT=https://hf-mirror.com` (already set in the `.bat` files and the pipeline).
 
 ---
 
-## 6. Layout del repo
+## 6. Repo layout
 
 ```text
 subtitler/
-  subtitular_alineado.bat     entrada recomendada
-  pipeline_aligned.py         orquestador del flujo alineado
-  build_subs.py               alineación por palabra → cues
-  analyze_srt.py              mide legibilidad de un SRT
-  measure_drift.py            mide sincronía contra la alineación
-  translate_srt.py            NLLB, --src cualquiera → ES/EN/ZH
+  subtitular_alineado.bat     recommended entry
+  pipeline_aligned.py         aligned-flow orchestrator
+  build_subs.py               word alignment → cues
+  analyze_srt.py              measures SRT readability
+  measure_drift.py            measures sync against alignment
+  translate_srt.py            NLLB, --src anything → ES/EN/ZH
 
-  subtitular_en_master.bat    entrada del pipeline heredado
-  subtitular.bat              1 pasada Whisper
-  pipeline_en_master.py       orquestador heredado
-  arbitrate_en_srt.py         elige entre 3 SRT EN
-  resegment_srt.py            cues legibles (flujo heredado)
+  subtitular_en_master.bat    legacy pipeline entry
+  subtitular.bat              1 Whisper pass
+  pipeline_en_master.py       legacy orchestrator
+  arbitrate_en_srt.py         picks among 3 EN SRTs
+  resegment_srt.py            readable cues (legacy flow)
 
-  safe_downloader/            descargas de modelos
-  whisperX/                   clon de referencia
-  README.md                   este manual
+  safe_downloader/            model downloads
+  whisperX/                   reference clone
+  README.md                   this manual
 ```
 
-No dejes `_test_*` ni `.log` en la raíz (están en `.gitignore`).
+Do not leave `_test_*` or `.log` files in the root (they are in `.gitignore`).
 
 ---
 
-## 7. Problemas conocidos (calidad)
+## 7. Known quality issues
 
-Usable como **borrador**. Revisa antes de publicar.
+Usable as a **draft**. Review before you publish.
 
-### Del pipeline alineado (el recomendado)
+### Aligned pipeline (the recommended one)
 
-**Un idioma por vídeo.** WhisperX alinea con un modelo por idioma, así que el flujo alineado asume que el vídeo es mayormente de un idioma. Para vídeos de verdad mezclados haría falta detectar el idioma por segmento y alinear cada grupo con su modelo; **no está hecho**.
+**One language per video.** WhisperX aligns with one model per language, so the aligned flow assumes the video is mostly one language. Truly mixed videos would need per-segment language detection and a matching aligner per group; **that is not built**.
 
-**NLLB traduce literal.** “Muy buenas gente” → “Very good people”. El inglés que escribía Whisper traduciendo sonaba mejor, aunque no siempre dijera lo que se dijo. Si quieres las dos cosas, la traducción con un LLM (DeepSeek) es el siguiente paso natural.
+**NLLB is literal.** “Muy buenas gente” → “Very good people”. The English Whisper wrote while translating sounded better, even when it did not say what was said. If you want both, LLM translation (DeepSeek) is the natural next step.
 
-**Cues densos.** ~13% pasan de 18 CPS cuando se habla rápido. Es real: el cue dura lo que dura la frase. Se puede aflojar subiendo `LEAD_OUT_SEC` en `build_subs.py`.
+**Dense cues.** ~13% go over 18 CPS when speech is fast. That is real: the cue lasts as long as the phrase. Loosen it by raising `LEAD_OUT_SEC` in `build_subs.py`.
 
-**ASR.** Sigue confundiendo nombres propios (“Ches” → “Chess”). Eso se arregla editando el SRT del idioma hablado y relanzando solo `translate_srt.py`.
+**ASR.** Still mangles proper names (“Ches” → “Chess”). Fix by editing the spoken-language SRT and rerunning only `translate_srt.py`.
 
-### Del pipeline heredado (3 pasadas)
+### Legacy pipeline (3 passes)
 
-**Árbitro.** No mide fidelidad, mide fluidez. Medido en un vídeo en español: eligió la pasada **china el 64%** de las veces, e incluyó créditos de TV china inventados sobre tramos sin voz (§3-bis).
+**Arbiter.** It does not measure fidelity, it measures fluency. On a Spanish video it picked the **Chinese pass 64%** of the time, and kept invented Chinese TV credits over silent stretches (§3-bis).
 
-**Resegment.** La 2ª línea a veces supera 42 caracteres. Algunos cues densos superan 6 s. Es inevitable: parte bloques de 24 s estimando por caracteres.
+**Resegment.** The 2nd line sometimes exceeds 42 characters. Some dense cues exceed 6 s. Inevitable: it splits 24 s blocks by estimating from character counts.
 
-**Sincronía.** El 26,5% de los cues aparecían sin que nadie estuviera hablando.
+**Sync.** 26.5% of cues appeared when nobody was talking.
 
-**Avisos en consola.** `triton not found`, `torchcodec` / FFmpeg DLL, Lightning `upgrade_checkpoint`, TF32: **ruido** si el progreso de Whisper sigue y al final hay SRT.
+**Console warnings.** `triton not found`, `torchcodec` / FFmpeg DLL, Lightning `upgrade_checkpoint`, TF32: **noise** if Whisper keeps progressing and an SRT appears at the end.
 
-**Flujo de revisión recomendado**
+**Recommended review flow**
 
-1. Pipeline completo.  
-2. Editar `subs.en.srt` (términos clave).  
-3. Regenerar ES: `python translate_srt.py --in "... subs.en.srt" --langs es`.  
-4. Subir a YouTube / Bilibili.
+1. Full pipeline.
+2. Edit `subs.en.srt` (key terms).
+3. Regenerate ES: `python translate_srt.py --in "... subs.en.srt" --langs es`.
+4. Upload to YouTube / Bilibili.
 
 ---
 
-## 8. Cómo modificarlo más adelante (atajos)
+## 8. Later tweaks (shortcuts)
 
-| Quiero… | Dónde |
+| I want… | Where |
 |---------|--------|
-| También chino en salida | `--langs es,en,zh` |
-| Solo el idioma hablado | `--skip-translate` |
-| Rehacer subtítulos sin transcribir otra vez | `--keep-work` una vez, luego `--skip-whisperx` |
-| Cues más largos o más cortos | `--max-sec` / `--max-chars`, o el CONFIG de `build_subs.py` |
-| Que el texto aguante más en pantalla | `LEAD_OUT_SEC` en `build_subs.py` |
-| Saber si un SRT está bien | `analyze_srt.py` y `measure_drift.py` |
-| Subtítulos más cortos/largos (flujo heredado) | `RESEGMENT_*` en el pipeline (o `resegment_srt.py`) |
-| Conservar las 3 pasadas Whisper | `KEEP_PASSES = True` o `--keep-passes` |
-| OOM / falta de VRAM | `WHISPER_BATCH_SIZE = 4` |
-| Python en otra ruta | `PY312` en los `.bat` **y** `PYTHON` en `pipeline_en_master.py` |
-| Hub oficial HF | `HF_ENDPOINT=` vacío en `.bat` y pipeline |
-| Re-traducir tras editar EN | solo `translate_srt.py` |
-| Re-arbitrar sin Whisper | `--keep-passes` una vez, luego `--skip-whisperx` |
+| Chinese in the output too | `--langs es,en,zh` |
+| Spoken language only | `--skip-translate` |
+| Rebuild subtitles without transcribing again | `--keep-work` once, then `--skip-whisperx` |
+| Longer or shorter cues | `--max-sec` / `--max-chars`, or the CONFIG in `build_subs.py` |
+| Text to linger on screen | `LEAD_OUT_SEC` in `build_subs.py` |
+| To know if an SRT is good | `analyze_srt.py` and `measure_drift.py` |
+| Shorter/longer subtitles (legacy flow) | `RESEGMENT_*` in the pipeline (or `resegment_srt.py`) |
+| Keep the 3 Whisper passes | `KEEP_PASSES = True` or `--keep-passes` |
+| OOM / not enough VRAM | `WHISPER_BATCH_SIZE = 4` |
+| Python in another path | `PY312` in the `.bat` files **and** `PYTHON` in `pipeline_en_master.py` |
+| Official HF hub | empty `HF_ENDPOINT=` in `.bat` and pipeline |
+| Re-translate after editing EN | `translate_srt.py` only |
+| Re-arbitrate without Whisper | `--keep-passes` once, then `--skip-whisperx` |
 
-Los defaults se editan en el bloque `# CONFIG` al **principio** de cada archivo (no hace falta buscar por el código).
+Defaults live in the `# CONFIG` block at the **top** of each file (no need to hunt through the code).

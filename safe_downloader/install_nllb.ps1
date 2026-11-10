@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$py = "C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
+$py = if ($env:PY312) { $env:PY312 } else { (& py -3.12 -c "import sys;print(sys.executable)") }
 $root = if ($WorkDir) { $WorkDir } else { Split-Path -Parent $PSScriptRoot }
 $log = Join-Path $root "safe_download.log"
 $modelId = "facebook/nllb-200-distilled-600M"
@@ -41,7 +41,7 @@ Log "HF_ENDPOINT=$($env:HF_ENDPOINT)"
 
 foreach ($pkg in @("sentencepiece", "accelerate", "protobuf")) {
   Log "pip ensure $pkg"
-  & $py -m pip install --default-timeout 1000 --retries 10 -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn $pkg
+  & $py -m pip install --default-timeout 1000 --retries 10 -i https://pypi.tuna.tsinghua.edu.cn/simple $pkg
   if ($LASTEXITCODE -ne 0) {
     & $py -m pip install --default-timeout 1000 --retries 10 $pkg
   }

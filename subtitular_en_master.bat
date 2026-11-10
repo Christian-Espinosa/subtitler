@@ -4,13 +4,13 @@ setlocal EnableExtensions EnableDelayedExpansion
 rem =============================================================================
 rem  CONFIG — easy to change
 rem =============================================================================
-set "PY312=C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
+rem Python and mirrors: _python.bat finds Python 3.12; set PY312 / HF_ENDPOINT in
+rem subtitler.local.bat (see subtitler.local.example.bat) if you need to.
+call "%~dp0_python.bat"
 set "PIPE=%~dp0pipeline_en_master.py"
 rem Extra flags always passed to the pipeline (optional). Example:
 rem   set "EXTRA_ARGS=--window 3 --langs en,es,zh"
 set "EXTRA_ARGS="
-rem Hugging Face mirror (needed in China / when huggingface.co is blocked)
-set "HF_ENDPOINT=https://hf-mirror.com"
 rem =============================================================================
 
 rem  subtitelar_en_master.bat

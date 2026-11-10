@@ -9,6 +9,21 @@ It is aimed at videos that mix **Spanish, English and/or Chinese**. Default outp
 
 Transcription never leaves the machine: models download once, then run from cache.
 
+
+**Setup notes (2026-11).**
+- *Python and mirrors.* The `.bat` files find Python 3.12 by themselves (`_python.bat`). To force one, or to use a
+  Hugging Face / pip mirror (e.g. in mainland China), copy `subtitler.local.example.bat` to `subtitler.local.bat`
+  (not committed) and set `PY312` / `HF_ENDPOINT`. Without a mirror, if huggingface.co does not answer, the aligned
+  pipeline uses the models already downloaded.
+- *Translation.* `pipeline_aligned.py` translates with an LLM by default (`llm_translate.py`: whole-video context,
+  each line kept within the time of its cue; needs `NVIDIA_API_KEY`, free, or `DEEPSEEK_API_KEY`).
+  `--translator nllb` uses NLLB-200 locally instead; its weights are CC-BY-NC-4.0 (non-commercial).
+- *Spoken language.* Transcription goes through `transcribe.py` (WhisperX Python API), because `python -m whisperx`
+  3.8 writes the wrong language in its JSON when it auto-detects.
+- *Tests.* `python -m unittest discover -s tests -t .` (no models needed).
+
+License: MIT (`LICENSE`). Third-party models keep their own licenses.
+
 ---
 
 ## Why this repo for subtitles
@@ -87,7 +102,7 @@ For **getting subtitles** — the SRT you upload to YouTube — this repo beats 
 | **CPS** | *Characters per second*: reading speed. ~18 is a typical YouTube cap. |
 | **NLLB** | Meta’s *No Language Left Behind*: EN → ES or ZH. **Does not** listen to audio; it translates the English SRT. |
 | **Hugging Face (HF)** | Model host. Typical cache: `%USERPROFILE%\.cache\huggingface\hub\`. |
-| **`HF_ENDPOINT`** | Alternate hub URL. In China / blocks: `https://hf-mirror.com`. |
+| **`HF_ENDPOINT`** | Alternate Hugging Face hub URL, for networks where huggingface.co is blocked (set it in `subtitler.local.bat`). |
 | **CUDA / `float16`** | NVIDIA GPU math. `float16` saves VRAM (RTX 3060 Ti). |
 | **`batch_size`** | How many audio chunks Whisper processes at once. Drop it (e.g. 4) if you OOM. |
 | **VAD** | *Voice Activity Detection*: where speech is. WhisperX uses Pyannote. |
@@ -280,10 +295,10 @@ Entry point. Checks Python 3.12, asks for or takes a path, strips quotes, calls 
 
 | Variable | Default | What for |
 |----------|---------|----------|
-| `PY312` | path to `python.exe` 3.12 | If you change Python install |
+| `PY312` | found by `_python.bat` | Set it in `subtitler.local.bat` to force one |
 | `PIPE` | `pipeline_en_master.py` next to the `.bat` | Leave it |
 | `EXTRA_ARGS` | empty | Flags **always** appended (e.g. `--langs en,es,zh`) |
-| `HF_ENDPOINT` | `https://hf-mirror.com` | HF mirror; empty = official hub |
+| `HF_ENDPOINT` | unset (official hub) | Mirror, in `subtitler.local.bat` |
 
 ### `subtitular.bat`
 
@@ -291,7 +306,7 @@ One WhisperX call (`transcribe` implicit, not translate). Renames `[stem].srt` �
 
 | Variable | Default | What for |
 |----------|---------|----------|
-| `PY312` | Python 3.12 | Same as above |
+| `PY312` | found by `_python.bat` | Same as above |
 | `WHISPER_MODEL` | `large-v2` | ASR model |
 | `BATCH_SIZE` | `8` | VRAM; lower if OOM |
 | `COMPUTE_TYPE` | `float16` | GPU precision |
@@ -305,7 +320,7 @@ Orchestrates the 4 programs. **Main CONFIG** if you want to change defaults.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `PYTHON` | Python 3.12 | Interpreter for WhisperX and child scripts |
-| `HF_ENDPOINT` | `https://hf-mirror.com` | Hugging Face mirror |
+| `HF_ENDPOINT` | environment | Hugging Face mirror (unset = official hub) |
 | `WHISPER_MODEL` | `large-v2` | ASR size (`large-v3` is heavier) |
 | `WHISPER_BATCH_SIZE` | `8` | GPU batches |
 | `WHISPER_COMPUTE_TYPE` | `float16` | Compute type |
@@ -454,7 +469,7 @@ Reference clone of WhisperX. **What actually runs** is the `pip` package (`pytho
 | GPU | Tested on RTX 3060 Ti |
 | Models | ASR `large-v2`, `distilgpt2`, NLLB-600M (HF cache) |
 
-If `huggingface.co` does not connect, leave `HF_ENDPOINT=https://hf-mirror.com` (already set in the `.bat` files and the pipeline).
+If `huggingface.co` does not connect, set `HF_ENDPOINT` to a mirror (for example `https://hf-mirror.com`) in `subtitler.local.bat`.
 
 ---
 

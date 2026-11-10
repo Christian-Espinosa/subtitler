@@ -93,11 +93,28 @@ def join_words(words: list[Word]) -> str:
     return out
 
 
-def split_utterances(words: list[Word], pause: float) -> list[list[Word]]:
+def crosses(breaks: list[float], a: Word | Cue, b: Word | Cue) -> bool:
+    """Is there a hard break (e.g. a change of speaker) between the middle of `a` and
+    the middle of `b`? Midpoints, because alignment often stretches a word over the
+    silence after it. Pure."""
+    lo, hi = (a.start + a.end) / 2, (b.start + b.end) / 2
+    return any(lo < t <= hi for t in breaks)
+
+
+def load_breaks(path: Path | None) -> list[float]:
+    """--breaks: a JSON list of seconds where a cue must end (dubbing: speaker turns)."""
+    if path is None:
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return sorted(float(t) for t in (data.get("breaks", []) if isinstance(data, dict) else data))
+
+
+def split_utterances(words: list[Word], pause: float, breaks: list[float] | None = None) -> list[list[Word]]:
+    breaks = breaks or []
     groups: list[list[Word]] = []
     cur: list[Word] = []
     for w in words:
-        if cur and w.start - cur[-1].end > pause:
+        if cur and (w.start - cur[-1].end > pause or crosses(breaks, cur[-1], w)):
             groups.append(cur)
             cur = [w]
         else:
@@ -169,7 +186,8 @@ def pack_utterance(
 
 
 def merge_short(
-    cues: list[Cue], *, max_chars: int, max_lines: int, max_sec: float, pause: float
+    cues: list[Cue], *, max_chars: int, max_lines: int, max_sec: float, pause: float,
+    breaks: list[float] | None = None,
 ) -> list[Cue]:
     """Glue tiny cues to their neighbour when they still fit.
 
@@ -186,7 +204,7 @@ def merge_short(
                 and c.end - prev.start <= max_sec
                 and fits_on_screen(joined, max_chars // max_lines, max_lines)
             )
-            close = c.start - prev.end <= pause
+            close = c.start - prev.end <= pause and not crosses(breaks or [], prev, c)
             too_short = (prev.end - prev.start) < MIN_CUE_SEC or (c.end - c.start) < MIN_CUE_SEC
             if fits and close and too_short:
                 out[-1] = Cue(prev.start, c.end, joined)
@@ -282,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-sec", type=float, default=MIN_CUE_SEC)
     p.add_argument("--max-cps", type=float, default=MAX_CPS)
     p.add_argument("--pause", type=float, default=PAUSE_SEC)
+    p.add_argument("--breaks", type=Path, default=None,
+                   help="JSON list of seconds where a cue must end (e.g. speaker changes for dubbing)")
     args = p.parse_args(argv)
 
     if not args.align.is_file():
@@ -296,8 +316,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     budget = args.max_chars * args.max_lines
+    breaks = load_breaks(args.breaks)
     cues: list[Cue] = []
-    for utt in split_utterances(words, args.pause):
+    for utt in split_utterances(words, args.pause, breaks):
         cues.extend(
             pack_utterance(utt, max_chars=budget, max_lines=args.max_lines, max_sec=args.max_sec)
         )
@@ -307,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         max_lines=args.max_lines,
         max_sec=args.max_sec,
         pause=args.pause,
+        breaks=breaks,
     )
     cues = polish(cues, min_sec=args.min_sec, lead_out=LEAD_OUT_SEC, min_gap=MIN_GAP_SEC)
 

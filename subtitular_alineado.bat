@@ -4,10 +4,11 @@ setlocal enabledelayedexpansion
 rem ============================================================
 rem CONFIG
 rem ============================================================
-set "PY312=C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
+rem Python and mirrors: _python.bat finds Python 3.12; set PY312 / HF_ENDPOINT in
+rem subtitler.local.bat (see subtitler.local.example.bat) if you need to.
+call "%~dp0_python.bat"
 set "PIPE=%~dp0pipeline_aligned.py"
 set "EXTRA_ARGS="
-set "HF_ENDPOINT=https://hf-mirror.com"
 rem ============================================================
 
 if not exist "%PY312%" (

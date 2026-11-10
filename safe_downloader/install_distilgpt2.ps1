@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$py = "C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
+$py = if ($env:PY312) { $env:PY312 } else { (& py -3.12 -c "import sys;print(sys.executable)") }
 $root = if ($WorkDir) { $WorkDir } else { Split-Path -Parent $PSScriptRoot }
 $log = Join-Path $root "safe_download.log"
 
@@ -28,7 +28,7 @@ $indexes = @(
 $okPip = $false
 foreach ($idx in $indexes) {
   Log "pip ensure huggingface_hub via $idx"
-  & $py -m pip install --default-timeout 1000 --retries 15 -i $idx --trusted-host ([uri]$idx).Host "huggingface_hub>=0.20"
+  & $py -m pip install --default-timeout 1000 --retries 15 -i $idx "huggingface_hub>=0.20"
   if ($LASTEXITCODE -eq 0) { $okPip = $true; break }
   Log "pip failed on $idx exit=$LASTEXITCODE"
 }

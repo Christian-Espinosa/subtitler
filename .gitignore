@@ -19,3 +19,6 @@ whisperX/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Local settings (Python path, mirrors): see subtitler.local.example.bat
+subtitler.local.bat

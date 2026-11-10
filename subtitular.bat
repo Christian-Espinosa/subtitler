@@ -4,14 +4,14 @@ setlocal EnableExtensions EnableDelayedExpansion
 rem =============================================================================
 rem  CONFIG — easy to change
 rem =============================================================================
-set "PY312=C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
+rem Python and mirrors: _python.bat finds Python 3.12; set PY312 / HF_ENDPOINT in
+rem subtitler.local.bat (see subtitler.local.example.bat) if you need to.
+call "%~dp0_python.bat"
 set "WHISPER_MODEL=large-v2"
 set "BATCH_SIZE=8"
 set "COMPUTE_TYPE=float16"
 rem Optional default language: es / en / zh  (empty = auto-detect)
 set "DEFAULT_LANGUAGE="
-rem Hugging Face mirror (needed when huggingface.co is blocked)
-set "HF_ENDPOINT=https://hf-mirror.com"
 rem =============================================================================
 
 rem  subtitelar.bat — single WhisperX pass → "[name] subs.srt"

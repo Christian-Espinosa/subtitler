@@ -10,10 +10,9 @@ from __future__ import annotations
 # =============================================================================
 # CONFIG - edit these (CLI flags override when passed)
 # =============================================================================
-PYTHON = r"C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
-
-# Hugging Face mirror (china / blocked huggingface.co). Empty = official hub.
-HF_ENDPOINT = "https://hf-mirror.com"
+# The Python running this script runs every step (set below, after the imports).
+# Hugging Face mirror: from the environment (HF_ENDPOINT), never a default here.
+HF_ENDPOINT = __import__("os").environ.get("HF_ENDPOINT", "")
 
 # WhisperX passes (audio language forced + --task translate -> English SRTs)
 WHISPER_MODEL = "large-v2"
@@ -52,6 +51,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+PYTHON = sys.executable
 
 ROOT = Path(__file__).resolve().parent
 ARBITER = ROOT / "arbitrate_en_srt.py"

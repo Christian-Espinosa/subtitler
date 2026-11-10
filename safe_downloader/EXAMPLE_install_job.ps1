@@ -23,7 +23,7 @@ function Log([string]$m) {
 # if ($LASTEXITCODE -ne 0) { Log "curl FAILED $LASTEXITCODE"; exit $LASTEXITCODE }
 
 # --- EJEMPLO: pip con timeout alto ---
-# $py = "C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
+# $py = "C:\Path\To\Python312\python.exe"
 # & $py -m pip install --default-timeout 1000 --retries 15 some-package
 # if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

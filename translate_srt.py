@@ -1,9 +1,16 @@
 """
-Translate an English SRT to Spanish and/or Chinese with NLLB-200.
+Translate an SRT to other languages, timings untouched.
+
+Default translator: an LLM that reads the whole video and keeps each line inside a
+duration budget (llm_translate.py; NVIDIA free tier, DeepSeek Flash as fallback;
+needs NVIDIA_API_KEY or DEEPSEEK_API_KEY).
+
+`--translator nllb` uses NLLB-200 locally instead. Its weights are licensed
+CC-BY-NC-4.0 (non-commercial): opt-in only, for personal use.
 
 Usage:
-  python translate_srt.py --in "video subs.en.srt" --langs es,zh
-  python translate_srt.py --in master.en.srt --langs es --out-dir D:\\out
+  python translate_srt.py --in "video subs.es.srt" --src es --langs en,zh
+  python translate_srt.py --in "video subs.en.srt" --langs es --translator nllb
 """
 from __future__ import annotations
 
@@ -28,8 +35,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
 SRT_BLOCK = re.compile(
@@ -47,6 +52,40 @@ NLLB_CODES = {
 }
 
 _HUB_NAME = re.compile(r"^models--(.+)$")
+
+# Chinese (and Japanese) are written without spaces between words: splitting
+# them "by word" gave one token per sentence, so a sentence that spanned three
+# cues landed whole on the first one and the other two were left empty
+# (measured 2026-11-09). There the unit is the character, and a character is
+# about two Latin letters wide on screen.
+CJK = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
+_ZH_PUNCT = str.maketrans({",": "，", ";": "；", ":": "：", "?": "？", "!": "！"})
+
+
+def is_cjk(text: str) -> bool:
+    return bool(CJK.search(text or ""))
+
+
+def tokens(text: str) -> list[str]:
+    """Words, or characters for CJK text."""
+    text = " ".join((text or "").split())
+    if is_cjk(text):
+        return [ch for ch in text if not ch.isspace()]
+    return text.split()
+
+
+def join_tokens(toks: list[str], cjk: bool) -> str:
+    return ("" if cjk else " ").join(toks)
+
+
+def line_limit(text: str, max_chars: int) -> int:
+    return max(8, max_chars // 2) if is_cjk(text) else max_chars
+
+
+def zh_punctuation(text: str) -> str:
+    """NLLB writes ASCII punctuation in Chinese; on screen it should be full-width."""
+    text = text.translate(_ZH_PUNCT)
+    return re.sub(r"(?<=[\u4e00-\u9fff])\.(?=\s|$)", "。", text)
 
 
 def normalize_path(raw: str | Path) -> Path:
@@ -80,16 +119,19 @@ def wrap_lines(text: str, max_chars: int = WRAP_MAX_CHARS, max_lines: int = WRAP
     add 20%), so this matters more here than in the source track.
     """
     text = " ".join(text.split())
+    cjk = is_cjk(text)
+    max_chars = line_limit(text, max_chars)
     if len(text) <= max_chars:
         return text
-    words = text.split()
+    words = tokens(text)
     if len(words) < 2:
         return text
+    sep = "" if cjk else " "
 
     best, best_cost = None, None
     for i in range(1, len(words)):
-        head = " ".join(words[:i])
-        tail = " ".join(words[i:])
+        head = sep.join(words[:i])
+        tail = sep.join(words[i:])
         if len(head) > max_chars:
             break
         if len(tail) > max_chars and max_lines <= 2:
@@ -100,12 +142,12 @@ def wrap_lines(text: str, max_chars: int = WRAP_MAX_CHARS, max_lines: int = WRAP
 
     if best is None:
         # No split fits: keep the first line legal and let the rest overflow.
-        head, tail = words[0], " ".join(words[1:])
+        head, tail = words[0], sep.join(words[1:])
         for i in range(2, len(words)):
-            candidate = " ".join(words[:i])
+            candidate = sep.join(words[:i])
             if len(candidate) > max_chars:
                 break
-            head, tail = candidate, " ".join(words[i:])
+            head, tail = candidate, sep.join(words[i:])
         return f"{head}\n{tail}"
 
     head, tail = best
@@ -149,8 +191,9 @@ def redistribute(source: list[str], translation: str) -> list[str]:
     if not translation:
         return source
 
+    cjk = is_cjk(translation)
     total = sum(len(s) for s in source) or 1
-    words = translation.split()
+    words = tokens(translation)
     if len(words) < len(source):
         # Not enough words to go around: put everything in the first cue.
         return [translation] + [""] * (len(source) - 1)
@@ -163,14 +206,14 @@ def redistribute(source: list[str], translation: str) -> list[str]:
     used = 0
     for i, s in enumerate(source):
         if i == len(source) - 1:
-            out.append(" ".join(words[used:]))
+            out.append(join_tokens(words[used:], cjk))
             break
         remaining_cues = len(source) - i - 1
         share = len(s) / total
         take = max(floor, round(share * len(words)))
         take = min(take, len(words) - used - remaining_cues * floor)
         take = max(1, take)
-        out.append(" ".join(words[used : used + take]))
+        out.append(join_tokens(words[used : used + take], cjk))
         used += take
     return out
 
@@ -201,26 +244,27 @@ def split_overflow(cues: list[Cue], max_chars: int, max_lines: int) -> list[Cue]
     which is an estimate — but inside a cue of a few seconds, not inside a
     30-second block, so the error stays under a couple of tenths.
     """
-    budget = max_chars * max_lines
     out: list[Cue] = []
     for c in cues:
         text = " ".join(c.text.split())
+        cjk = is_cjk(text)
+        budget = line_limit(text, max_chars) * max_lines
         if len(text) <= budget:
             out.append(c)
             continue
 
         parts = max(2, -(-len(text) // budget))
-        words = text.split()
+        words = tokens(text)
         target = len(text) / parts
         chunks: list[str] = []
         cur: list[str] = []
         for w in words:
             cur.append(w)
-            if len(" ".join(cur)) >= target and len(chunks) < parts - 1:
-                chunks.append(" ".join(cur))
+            if len(join_tokens(cur, cjk)) >= target and len(chunks) < parts - 1:
+                chunks.append(join_tokens(cur, cjk))
                 cur = []
         if cur:
-            chunks.append(" ".join(cur))
+            chunks.append(join_tokens(cur, cjk))
 
         start, end = ts_to_sec(c.start_ts), ts_to_sec(c.end_ts)
         total = sum(len(ch) for ch in chunks) or 1
@@ -264,6 +308,10 @@ def resolve_model(model_id: str) -> str:
 
 class NllbTranslator:
     def __init__(self, model_id: str, device: str | None = None):
+        import torch  # heavy: only when a model is actually loaded
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+        self._torch = torch
         resolved = resolve_model(model_id)
         local_only = Path(resolved).is_dir()
         kw = {"local_files_only": True} if local_only else {}
@@ -276,8 +324,11 @@ class NllbTranslator:
         self.model.eval()
         self.resolved = resolved
 
-    @torch.inference_mode()
     def translate_batch(self, texts: list[str], src: str, tgt: str) -> list[str]:
+        with self._torch.inference_mode():
+            return self._translate_batch(texts, src, tgt)
+
+    def _translate_batch(self, texts: list[str], src: str, tgt: str) -> list[str]:
         if not texts:
             return []
         src_code = NLLB_CODES[src]
@@ -315,6 +366,7 @@ def translate_file(
     model_id: str,
     device: str | None,
     source: str = "en",
+    translator: str = "llm",
 ) -> list[Path]:
     cues = parse_srt(src_srt)
     if not cues:
@@ -342,6 +394,10 @@ def translate_file(
     if not need:
         return written
 
+    if translator == "llm":
+        return _translate_llm(cues, source, need, out_dir, out_name)
+
+    print("NLLB-200 weights are CC-BY-NC-4.0: non-commercial use only.", flush=True)
     tr = NllbTranslator(model_id, device=device)
     groups = group_sentences(cues)
     texts = [" ".join(cues[i].text for i in g) for g in groups]
@@ -352,6 +408,8 @@ def translate_file(
         print(f"Translating {NLLB_CODES[source]} -> {lang} ({NLLB_CODES[lang]}), "
               f"{len(cues)} cues en {len(texts)} frases ...", flush=True)
         translated = tr.translate_batch(texts, source, lang)
+        if lang == "zh":
+            translated = [zh_punctuation(t) for t in translated]
 
         out_cues: list[Cue] = []
         for g, whole in zip(groups, translated):
@@ -368,8 +426,29 @@ def translate_file(
     return written
 
 
+def _translate_llm(cues: list[Cue], source: str, need: list[str], out_dir: Path, out_name) -> list[Path]:
+    import llm_translate
+
+    written: list[Path] = []
+    spans = [(ts_to_sec(c.start_ts), ts_to_sec(c.end_ts), c.text) for c in cues]
+    for lang in need:
+        report = llm_translate.Report()
+        print(f"Translating {source} -> {lang} with an LLM, {len(cues)} cues ...", flush=True)
+        texts = llm_translate.translate_cues(spans, source, lang, report=report)
+        if lang == "zh":
+            texts = [zh_punctuation(t) for t in texts]
+        out_cues = [Cue(c.start_ts, c.end_ts, t) for c, t in zip(cues, texts) if t.strip()]
+        out_cues = split_overflow(out_cues, WRAP_MAX_CHARS, WRAP_MAX_LINES)
+        dest = out_dir / out_name(lang)
+        write_srt(dest, out_cues)
+        print(f"Wrote {dest}  (provider: {', '.join(dict.fromkeys(report.provider_used))}; "
+              f"rewritten shorter: {report.rewritten}; still over budget: {report.over_budget})", flush=True)
+        written.append(dest)
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Translate English SRT with NLLB to ES/ZH")
+    p = argparse.ArgumentParser(description="Translate an SRT (LLM by default, NLLB opt-in)")
     p.add_argument("--in", dest="inp", required=True, help="English master SRT")
     p.add_argument(
         "--langs",
@@ -385,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Language of the input SRT (en|es|zh). The aligned pipeline "
              "transcribes in the spoken language, so this is often 'es'.",
     )
+    p.add_argument("--translator", default="llm", choices=["llm", "nllb"],
+                   help="llm (default) or nllb (local, CC-BY-NC: personal use only)")
     args = p.parse_args(argv)
 
     src = normalize_path(args.inp)
@@ -392,12 +473,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ERROR] file not found: {src}", file=sys.stderr)
         return 1
     source = args.src.strip().lower()
-    if source not in NLLB_CODES:
+    if args.translator == "nllb" and source not in NLLB_CODES:
         print(f"[ERROR] unsupported --src: {source}", file=sys.stderr)
         return 1
     langs = [x.strip().lower() for x in args.langs.split(",") if x.strip()]
     out_dir = normalize_path(args.out_dir) if args.out_dir else None
-    written = translate_file(src, langs, out_dir, args.model, args.device, source)
+    written = translate_file(src, langs, out_dir, args.model, args.device, source, args.translator)
     return 0 if written or not [l for l in langs if l != source] else 1
 
 

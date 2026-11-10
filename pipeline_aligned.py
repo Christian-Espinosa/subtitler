@@ -26,15 +26,20 @@ from __future__ import annotations
 # =============================================================================
 # CONFIG — edit these defaults (CLI flags override)
 # =============================================================================
-PYTHON = r"C:\Users\chres\AppData\Local\Programs\Python\Python312\python.exe"
-HF_ENDPOINT = "https://hf-mirror.com"      # "" = official hub
+# The Python running this script runs every step: no path to a particular PC.
+# Hugging Face mirror: set HF_ENDPOINT in the environment (or in
+# subtitler.local.bat on Windows) when huggingface.co is blocked, e.g. in China.
 
-WHISPER_MODEL = "large-v2"
+WHISPER_MODEL = "auto"                      # auto = large-v2 on GPU, small on CPU
+WHISPER_MODEL_GPU = "large-v2"
+WHISPER_MODEL_CPU = "small"
 WHISPER_BATCH_SIZE = 8
-WHISPER_COMPUTE_TYPE = "float16"
+WHISPER_COMPUTE_TYPE = "auto"               # auto = float16 on GPU, int8 on CPU
+DEVICE = "auto"                             # auto | cuda | cpu
 SPOKEN_LANGUAGE = ""                        # "" = let Whisper detect it
 
 OUTPUT_SUB_LANGS = ["es", "en"]             # tracks to write
+TRANSLATOR = "llm"                          # llm (NVIDIA free -> DeepSeek Flash) | nllb (CC-BY-NC, opt-in)
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
 
 # Screen limits, passed to build_subs.py
@@ -54,7 +59,9 @@ import sys
 import time
 from pathlib import Path
 
+PYTHON = sys.executable
 ROOT = Path(__file__).resolve().parent
+TRANSCRIBE = ROOT / "transcribe.py"
 BUILD_SUBS = ROOT / "build_subs.py"
 TRANSLATE = ROOT / "translate_srt.py"
 ANALYZE = ROOT / "analyze_srt.py"
@@ -90,6 +97,42 @@ def media_duration(path: Path) -> float:
         return 0.0
 
 
+def hub_reachable(url: str = "https://huggingface.co", timeout: float = 3.0) -> bool:
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=timeout)
+        return True
+    except Exception:  # noqa: BLE001 - any failure means "not reachable from here"
+        return False
+
+
+def ensure_hub(env: dict | None = None, reachable=None) -> str:
+    """Where models come from. HF_ENDPOINT if set (a mirror, e.g. in subtitler.local.bat);
+    else huggingface.co; if it does not answer (blocked network), offline mode with the
+    models already downloaded, so a PC that has them keeps working without a mirror."""
+    import os
+
+    env = os.environ if env is None else env
+    if env.get("HF_ENDPOINT") or env.get("HF_HUB_OFFLINE"):
+        return f"models from {env.get('HF_ENDPOINT') or 'local cache'}"
+    if (reachable or hub_reachable)():
+        return "models from huggingface.co"
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    return ("huggingface.co does not answer: offline mode, using the models already downloaded. "
+            "If one is missing, set HF_ENDPOINT to a mirror (subtitler.local.bat on Windows).")
+
+
+def resolve_model(model: str, device: str) -> str:
+    """`auto`: large-v2 where there is a GPU, small on CPU (large-v2 on CPU is ~10x slower)."""
+    if model and model != "auto":
+        return model
+    from transcribe import pick_device
+
+    return WHISPER_MODEL_GPU if pick_device(device) == "cuda" else WHISPER_MODEL_CPU
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Aligned subtitle pipeline")
     p.add_argument("media", help="Video or audio file")
@@ -100,22 +143,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", default=WHISPER_MODEL)
     p.add_argument("--batch-size", type=int, default=WHISPER_BATCH_SIZE)
     p.add_argument("--compute-type", default=WHISPER_COMPUTE_TYPE)
+    p.add_argument("--device", default=DEVICE, help="auto|cuda|cpu")
     p.add_argument("--max-chars", type=int, default=MAX_CHARS_PER_LINE)
     p.add_argument("--max-sec", type=float, default=MAX_CUE_SEC)
     p.add_argument("--skip-translate", action="store_true")
+    p.add_argument("--translator", default=TRANSLATOR, choices=["llm", "nllb"],
+                   help="llm (default; needs NVIDIA_API_KEY or DEEPSEEK_API_KEY) or nllb (local, non-commercial)")
     p.add_argument("--skip-whisperx", action="store_true",
                    help="Reuse the alignment JSON from a previous run")
     p.add_argument("--keep-work", action="store_true", default=KEEP_WORK)
     args = p.parse_args(argv)
 
+    print(ensure_hub(), flush=True)
     media = normalize_path(args.media)
     if not media.is_file():
         print(f"[ERROR] no existe: {media}", file=sys.stderr)
         return 1
-
-    if HF_ENDPOINT:
-        import os
-        os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINT)
 
     out_dir = media.parent
     work = out_dir / "_work"
@@ -142,14 +185,11 @@ def main(argv: list[str] | None = None) -> int:
 
         # 2) Transcribir EN EL IDIOMA HABLADO (no translate) para que WhisperX
         # alinee palabra por palabra.
-        cmd = [PYTHON, "-m", "whisperx", str(audio),
-               "--model", args.model,
-               "--task", "transcribe",
-               "--output_dir", str(work),
-               "--output_format", "json",
-               "--compute_type", args.compute_type,
-               "--batch_size", str(args.batch_size),
-               "--print_progress", "True"]
+        # (Python API, not `python -m whisperx`: its CLI writes the wrong language, see transcribe.py)
+        model = resolve_model(args.model, args.device)
+        cmd = [PYTHON, str(TRANSCRIBE), str(audio), "--out", str(align_json),
+               "--model", model, "--device", args.device,
+               "--compute-type", args.compute_type, "--batch-size", str(args.batch_size)]
         if args.language:
             cmd += ["--language", args.language]
         run(cmd, f"2/4  WhisperX transcribe + alineacion ({args.language or 'auto'})")
@@ -178,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     if others and not args.skip_translate:
         run(
             [PYTHON, str(TRANSLATE), "--in", str(native_srt), "--src", spoken,
-             "--langs", ",".join(others), "--model", NLLB_MODEL],
+             "--langs", ",".join(others), "--translator", args.translator, "--model", NLLB_MODEL],
             f"4/4  Traducir {spoken} -> {', '.join(others)}",
         )
     else:

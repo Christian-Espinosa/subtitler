@@ -38,6 +38,31 @@ def pick_compute_type(device: str, compute_type: str = "auto") -> str:
     return "float16" if device == "cuda" else "int8"
 
 
+def peak_mb() -> int | None:
+    """Peak resident memory of this process so far, in MB (Linux/macOS; None on Windows)."""
+    try:
+        import resource
+
+        kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(kb / 1024) if sys.platform != "darwin" else int(kb / 1024 / 1024)
+    except ImportError:
+        return None
+
+
+def free_memory() -> None:
+    """Give back what a model held before loading the next (Python + torch caches)."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def result_json(aligned: dict, language: str) -> dict:
     """What `build_subs.py` reads: segments, word_segments and the real language."""
     return {
@@ -84,11 +109,18 @@ def main(argv: list[str] | None = None) -> int:
         print("[ERROR] Whisper did not report a language; pass --language", file=sys.stderr)
         return 1
     print(f"spoken language: {language}", flush=True)
+    print(f"[mem] peak after transcribe {peak_mb()} MB", flush=True)
+    # The Whisper model is not needed to align: free it first, so the peak is the larger of
+    # the two models, not their sum.
     del model
+    free_memory()
 
     align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
     aligned = whisperx.align(result["segments"], align_model, metadata, audio, device,
                              return_char_alignments=False)
+    del align_model
+    free_memory()
+    print(f"[mem] peak after align {peak_mb()} MB", flush=True)
     print(f"[time] load {t1 - t0:.1f}s, transcribe {t2 - t1:.1f}s, align (incl. load) {time.monotonic() - t2:.1f}s",
           flush=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)

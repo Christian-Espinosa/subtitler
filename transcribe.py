@@ -56,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--device", default="auto", help="auto|cuda|cpu")
     p.add_argument("--compute-type", default="auto", help="auto|float16|int8|float32")
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--chunk-size", type=int, default=15,
+                   help="VAD chunk seconds. WhisperX decodes one text per chunk; with 30 s chunks whole "
+                        "sentences were dropped (measured 2026-11-10, FLEURS en: 3 of 8 lost; 15 s: none)")
     args = p.parse_args(argv)
 
     import time
@@ -70,9 +73,10 @@ def main(argv: list[str] | None = None) -> int:
 
     audio = whisperx.load_audio(str(args.audio))
     model = whisperx.load_model(args.model, device, compute_type=compute_type,
-                                language=args.language or None)
+                                language=args.language or None,
+                                vad_options={"chunk_size": args.chunk_size})
     t1 = time.monotonic()
-    result = model.transcribe(audio, batch_size=args.batch_size,
+    result = model.transcribe(audio, batch_size=args.batch_size, chunk_size=args.chunk_size,
                               language=args.language or None, print_progress=True)
     t2 = time.monotonic()
     language = args.language or result.get("language") or ""

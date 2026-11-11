@@ -551,3 +551,10 @@ Usable as a **draft**. Review before you publish.
 | Re-arbitrate without Whisper | `--keep-passes` once, then `--skip-whisperx` |
 
 Defaults live in the `# CONFIG` block at the **top** of each file (no need to hunt through the code).
+
+
+## Vertical videos (9:16)
+
+`python burn_subs.py --video clip.mp4 --srt "clip subs.es.srt"` burns the subtitles into a
+1080x1920 MP4 for Shorts / Reels / TikTok: the picture is padded over a blurred copy of itself
+(`--mode pad`, default) or cropped (`--mode crop`), and the lines sit above the apps' buttons.

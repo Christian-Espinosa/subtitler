@@ -79,6 +79,24 @@ class Report:
     rewritten: int = 0
     over_budget: int = 0
     tones: dict[int, str] = field(default_factory=dict)   # cue index (0-based) -> tone
+    # tokens per provider, from the API's own `usage` (what a job cost; the service keeps its ledger)
+    usage: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def add_usage(self, provider: str, u: dict | None) -> None:
+        if not u:
+            return
+        row = self.usage.setdefault(provider, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        row["calls"] += 1
+        for k in ("prompt_tokens", "completion_tokens"):
+            try:
+                row[k] += int(u.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+
+
+# The `usage` of the last answer of `_post` (a chat function returns only text; tests pass
+# their own chat and leave this empty).
+_LAST_USAGE: dict = {}
 
 
 def cps_for(lang: str) -> float:
@@ -98,6 +116,8 @@ def _post(provider: Provider, messages: list[dict], timeout: float = TIMEOUT) ->
                                           "Authorization": f"Bearer {provider.key()}"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read().decode("utf-8"))
+    _LAST_USAGE.clear()
+    _LAST_USAGE.update(data.get("usage") or {})
     return str(data["choices"][0]["message"]["content"] or "")
 
 
@@ -192,6 +212,7 @@ def _ask(cues: list[dict], src: str, tgt: str, context: str, report: Report, *, 
                 got = None
             if got is not None:
                 report.provider_used.append(p.name)
+                report.add_usage(p.name, dict(_LAST_USAGE) if chat is _post else None)
                 if not shorter:
                     report.tones.update({i - 1: t for i, t in parse_tones(raw).items()})
                 return got

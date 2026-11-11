@@ -105,3 +105,12 @@ class Tone(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Usage(unittest.TestCase):
+    def test_tokens_per_provider_are_added_up(self):
+        r = lt.Report()
+        r.add_usage("nvidia", {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})
+        r.add_usage("nvidia", {"prompt_tokens": 50, "completion_tokens": 5})
+        r.add_usage("deepseek", None)
+        self.assertEqual(r.usage, {"nvidia": {"calls": 2, "prompt_tokens": 150, "completion_tokens": 25}})

@@ -19,6 +19,10 @@ class Ass(unittest.TestCase):
         self.assertIn("Dialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,Hola a todos", ass)
         self.assertIn("(raro) línea\\Nsegunda", ass)  # braces would be ASS override codes
 
+    def test_speaker_colour_becomes_an_ass_override(self):
+        ass = b.srt_to_ass('1\n00:00:00,000 --> 00:00:01,000\n<font color="#FFD23F">Hola <i>tú</i></font>\n')
+        self.assertIn("{\\c&H3FD2FF&}Hola tú{\\r}", ass)
+
     def test_chinese_gets_a_cjk_font(self):
         font = b.srt_to_ass("1\n00:00:00,000 --> 00:00:01,000\n大家好\n").split("Style: Default,")[1].split(",")[0]
         self.assertIn(font, ("Noto Sans CJK SC", "Microsoft YaHei"))

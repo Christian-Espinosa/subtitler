@@ -58,8 +58,22 @@ def parse_srt(text: str) -> list[tuple[str, str, str]]:
     return out
 
 
+FONT = re.compile(r'<font\s+color="?#([0-9A-Fa-f]{6})"?\s*>(.*?)</font>', re.DOTALL | re.IGNORECASE)
+TAG = re.compile(r"</?[a-zA-Z][^>]*>")
+
+
+def ass_colour(hex6: str) -> str:
+    """#RRGGBB -> ASS &HBBGGRR& (ASS is blue-green-red)."""
+    r, g, b = hex6[0:2], hex6[2:4], hex6[4:6]
+    return f"&H{b}{g}{r}&".upper()
+
+
 def ass_escape(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")").replace("\n", "\\N")
+    """SRT text -> ASS. `<font color="#RRGGBB">` (speaker colours) becomes an ASS colour
+    override; any other tag is dropped; braces would be override codes, so they become ()."""
+    t = text.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
+    t = FONT.sub(lambda m: "{\\c" + ass_colour(m.group(1)) + "}" + m.group(2) + "{\\r}", t)
+    return TAG.sub("", t).replace("\n", "\\N")
 
 
 def srt_to_ass(srt_text: str, *, font: str = "", size: int = FONT_SIZE, margin_v: int = MARGIN_V,

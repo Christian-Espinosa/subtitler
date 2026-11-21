@@ -60,6 +60,11 @@ class Provider:
     base_url: str
     model: str
     key_env: str
+    # Extra fields of the request body. 21/11/2026 (measured on a 60 s English clip, 3 runs): deepseek-flash reasons
+    # before answering, 0 to 8,000 tokens per batch (6,289; 0; and once 8,000 with an EMPTY answer: the cap was all
+    # reasoning, and the batch was retried). Translating does not need it: with thinking disabled the same batch
+    # costs ~340 output tokens.
+    extra: dict = field(default_factory=dict)
 
     def key(self) -> str:
         return os.environ.get(self.key_env, "").strip()
@@ -67,8 +72,10 @@ class Provider:
 
 PROVIDERS = [
     Provider("nvidia", "https://integrate.api.nvidia.com/v1", "nvidia/nemotron-3-ultra-550b-a55b", "NVIDIA_API_KEY"),
-    Provider("deepseek", "https://api.deepseek.com", "deepseek-flash", "DEEPSEEK_API_KEY"),
+    Provider("deepseek", "https://api.deepseek.com", "deepseek-flash", "DEEPSEEK_API_KEY",
+             extra={"thinking": {"type": "disabled"}}),
 ]
+MAX_TOKENS = 8000           # the most a batch may ask for; each batch asks for what its lines can take (`tope`)
 
 
 @dataclass
@@ -108,9 +115,15 @@ def budget(start: float, end: float, lang: str) -> int:
     return max(4, int(BUDGET_FACTOR * max(0.0, end - start) * cps_for(lang)))
 
 
-def _post(provider: Provider, messages: list[dict], timeout: float = TIMEOUT) -> str:
+def tope(cues: list[dict]) -> int:
+    """max_tokens for one batch: the characters its lines may take (a token is at least one character in any
+    language), plus JSON per line and room for the tone tags. Never above MAX_TOKENS. Pure."""
+    return min(MAX_TOKENS, 300 + sum(int(c.get("max_chars") or 80) + 15 for c in cues))
+
+
+def _post(provider: Provider, messages: list[dict], timeout: float = TIMEOUT, max_tokens: int = MAX_TOKENS) -> str:
     body = json.dumps({"model": provider.model, "messages": messages, "temperature": 0.3,
-                       "max_tokens": 8000}).encode("utf-8")
+                       "max_tokens": int(max_tokens), **provider.extra}).encode("utf-8")
     req = urllib.request.Request(provider.base_url.rstrip("/") + "/chat/completions", data=body, method="POST",
                                  headers={"Content-Type": "application/json",
                                           "Authorization": f"Bearer {provider.key()}"})
@@ -205,7 +218,7 @@ def _ask(cues: list[dict], src: str, tgt: str, context: str, report: Report, *, 
         for attempt in range(RETRIES + 1):
             raw = ""
             try:
-                raw = chat(p, messages)
+                raw = _post(p, messages, max_tokens=tope(cues)) if chat is _post else chat(p, messages)
                 got = parse_answer(raw, ids)
             except Exception as exc:  # noqa: BLE001 - network/HTTP: retry, then next provider
                 report.failures.append(f"{p.name}: {type(exc).__name__}: {str(exc)[:120]}")
